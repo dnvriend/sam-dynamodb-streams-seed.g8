@@ -4,7 +4,6 @@ import java.util.UUID
 
 import com.amazonaws.services.dynamodbv2.model.{AttributeValue, PutItemRequest, ReturnValue}
 import com.amazonaws.services.dynamodbv2.{AmazonDynamoDB, AmazonDynamoDBClientBuilder}
-import com.amazonaws.services.lambda.runtime.Context
 import com.github.dnvriend.lambda._
 import com.github.dnvriend.lambda.annotation.{DynamoHandler, HttpHandler}
 import play.api.libs.json.Reads._
@@ -17,83 +16,89 @@ object Person {
 }
 final case class Person(name: String, id: Option[String] = None)
 
-object PersonRepository {
-  final val TableName = {
-    val projectName = sys.env("PROJECT_NAME")
-    val stage = sys.env("STAGE")
-    s"$projectName-$stage-people"
-  }
+class PersonRepository(tableName: String, ctx: SamContext) {
+  val table: String = ctx.dynamoDbTableName(tableName)
   val db: AmazonDynamoDB = AmazonDynamoDBClientBuilder.defaultClient()
+
+  def id: String = UUID.randomUUID.toString
 
   def put(id: String, person: Person): Unit = {
     db.putItem(
       new PutItemRequest()
-        .withTableName(TableName)
+        .withTableName(table)
         .withReturnValues(ReturnValue.NONE)
         .withItem(
           Map(
             "id" -> new AttributeValue(id),
-            "json" -> new AttributeValue(Json.toJson(person).toString)
+            "json" -> new AttributeValue(Json.toJson(person.copy(id = Option(id))).toString)
           ).asJava
         )
     )
   }
 
   def get(id: String): Person = {
-    val json = db.getItem(TableName, Map("id" -> new AttributeValue(id)).asJava)
+    val json = db.getItem(table, Map("id" -> new AttributeValue(id)).asJava)
       .getItem.get("json").getS
     Json.parse(json).as[Person]
+  }
+
+  def list: List[Person] = {
+    db.scan(table, List("json").asJava)
+      .getItems.asScala.flatMap(_.values().asScala).map(_.getS).toList
+      .map(Json.parse)
+      .map(_.as[Person])
   }
 }
 
 @HttpHandler(path = "/person", method = "post")
 class PostPerson extends ApiGatewayHandler {
-  override def handle(request: HttpRequest, ctx: Context): HttpResponse = {
-    println("stage: " + sys.env("STAGE"))
-    println("projectName: " + sys.env("PROJECT_NAME"))
-    println("version: " + sys.env("VERSION"))
-    println(request.body.toString())
+  override def handle(request: HttpRequest, ctx: SamContext): HttpResponse = {
+    val repo = new PersonRepository("people", ctx)
+    val id: String = repo.id
     val person = request.bodyOpt[Person].get
-    val id = UUID.randomUUID.toString
-    PersonRepository.put(id, person)
-    HttpResponse(200, Json.toJson(person.copy(id = Option(id))), Map.empty)
+    repo.put(id, person)
+    HttpResponse.ok.withBody(Json.toJson(person.copy(id = Option(id))))
   }
 }
 
-object PersonId {
-  implicit val format: Format[PersonId] = Json.format
+@HttpHandler(path = "/person", method = "get")
+class GetListOfPerson extends ApiGatewayHandler {
+  override def handle(request: HttpRequest, ctx: SamContext): HttpResponse = {
+    val repo = new PersonRepository("people", ctx)
+    HttpResponse.ok.withBody(Json.toJson(repo.list))
+  }
 }
-final case class PersonId(id: String)
+
 @HttpHandler(path = "/person/{id}", method = "get")
 class GetPerson extends ApiGatewayHandler {
-  override def handle(request: HttpRequest, ctx: Context): HttpResponse = {
-    val person = PersonRepository.get(request.pathParamsOpt[PersonId].get.id)
-    HttpResponse(200, Json.toJson(person), Map.empty)
+  override def handle(request: HttpRequest, ctx: SamContext): HttpResponse = {
+    val repo = new PersonRepository("people", ctx)
+    request.pathParamsOpt[Map[String, String]].getOrElse(Map.empty).get("id")
+      .fold(HttpResponse.notFound.withBody(Json.toJson("Person not found")))(id => {
+        HttpResponse.ok.withBody(Json.toJson(repo.get(id)))
+      })
   }
 }
 
-// dynamodb streams //
-object PersonIdsRepository {
-  final val TableName = {
-    val projectName = sys.env("PROJECT_NAME")
-    val stage = sys.env("STAGE")
-    s"$projectName-$stage-people_ids"
-  }
+class PersonIdsRepository(tableName: String, ctx: SamContext) {
+  val table: String = ctx.dynamoDbTableName(tableName)
   val db: AmazonDynamoDB = AmazonDynamoDBClientBuilder.defaultClient()
 
-  def put(id: String): Unit = {
-    db.putItem(
-      new PutItemRequest()
-        .withTableName(TableName)
-        .withReturnValues(ReturnValue.NONE)
-        .withItem(Map("id" -> new AttributeValue(id)).asJava)
-    )
-  }
+  def id: String = UUID.randomUUID.toString
 
-  def list: List[String] = {
-    db.scan(TableName, List("id").asJava)
-      .getItems.asScala.flatMap(_.values().asScala).map(_.getS).toList
-  }
+    def put(id: String): Unit = {
+      db.putItem(
+        new PutItemRequest()
+          .withTableName(table)
+          .withReturnValues(ReturnValue.NONE)
+          .withItem(Map("id" -> new AttributeValue(id)).asJava)
+      )
+    }
+
+    def list: List[String] = {
+      db.scan(table, List("id").asJava)
+        .getItems.asScala.flatMap(_.values().asScala).map(_.getS).toList
+    }
 }
 
 object PersonIdStream {
@@ -104,16 +109,18 @@ object PersonIdStream {
 final case class PersonIdStream(id: String)
 @DynamoHandler(tableName = "People")
 class PersonIdDynamoDBHandler extends DynamoDBHandler {
-  override def handle(request: DynamoDbRequest, ctx: Context): Unit = {
+  override def handle(request: DynamoDbRequest, ctx: SamContext): Unit = {
+    val repo = new PersonIdsRepository("people_ids", ctx)
     request.getInsertedKeys[PersonIdStream].map(_.id).foreach { id =>
-      PersonIdsRepository.put(id)
+      repo.put(id)
     }
   }
 }
 
 @HttpHandler(path = "/personids", method = "get")
 class GetPersonIds extends ApiGatewayHandler {
-  override def handle(request: HttpRequest, ctx: Context): HttpResponse = {
-    HttpResponse(200, Json.toJson(PersonIdsRepository.list), Map.empty)
+  override def handle(request: HttpRequest, ctx: SamContext): HttpResponse = {
+    val repo = new PersonIdsRepository("people_ids", ctx)
+    HttpResponse.ok.withBody(Json.toJson(repo.list))
   }
 }
