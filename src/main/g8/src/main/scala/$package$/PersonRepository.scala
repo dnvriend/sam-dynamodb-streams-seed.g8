@@ -21,7 +21,7 @@ object PersonRepository {
   final val TableName = {
     val projectName = sys.env("PROJECT_NAME")
     val stage = sys.env("STAGE")
-    s"$projectName-$stage-people"
+
   }
   val db: AmazonDynamoDB = AmazonDynamoDBClientBuilder.defaultClient()
 
